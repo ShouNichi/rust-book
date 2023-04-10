@@ -205,7 +205,7 @@ Let's walk through each line:
 2. After `let num = &vec[2]`, the data in `vec` has been **borrowed** by `num` (indicated by <i class="fa fa-arrow-right"></i>). Three things happen:
    - The borrow removes @Perm[lost]{write}@Perm[lost]{own} permissions from `vec` (the slash indicates loss). `vec` cannot be written or owned, but it can still be read.
    - The variable `num` has gained @Perm{read}@Perm{own} permissions. `num` is not writable (the missing @Perm{write} permission is shown as a dash <span class="perm write">‒</span>) because it was not marked `let mut`.
-   - The **path** `*num` has gained @Perm{read}@Perm{own} permissions.
+   - The **path** `*num` has gained the @Perm{read} permission.
 3. After `println!(...)`, then `num` is no longer in use, so `vec` is no longer borrowed. Therefore:
    - `vec` regains its @Perm{write}@Perm{own} permissions (indicated by <i class="fa fa-rotate-left"></i>).
    - `num` and `*num` have lost all of their permissions (indicated by <i class="fa fa-level-down"></i>).
@@ -222,8 +222,6 @@ let mut x_ref = &x;
 ```
 
 Notice that `x_ref` has the @Perm{write} permission, while `*x_ref` does not. That means we can assign `x_ref` to a different reference (e.g. `x_ref = &y`), but we cannot mutate the pointed data (e.g. `*x_ref += 1`).
-
-> *Note:* you might wonder why `*num` and `*x_ref` have the @Perm{own} permission, since references are non-owning pointers. That's because the vector contains numbers of type `i32`, and `i32` is a *copyable* type. We will discuss this difference more next section in ["Copying vs. Moving Out of a Collection"](ch04-03-fixing-ownership-errors.html#fixing-an-unsafe-program-copying-vs-moving-out-of-a-collection).
 
 More generally, permissions are defined on **paths** and not just variables. A path is anything you can put on the left-hand side of an assignment. Paths include:
 
@@ -302,8 +300,8 @@ println!("Vector is now {:?}", vec);
 
 A mutable reference is created with the `&mut` operator. The type of `num` is written as `&mut i32`. Compared to immutable references, you can see two important differences in the permissions:
 
-1. When `num` was an immutable reference, `vec` still had @Perm{read} permissions. Now that `num` is a mutable reference, `vec` has lost _all_ permissions while `num` is in use.
-2. When `num` was an immutable reference, the path `*num` only had @Perm{read}@Perm{own} permissions. Now that `num` is a mutable reference, `*num` has also gained the @Perm{write} permission.
+1. When `num` was an immutable reference, `vec` still had the @Perm{read} permission. Now that `num` is a mutable reference, `vec` has lost _all_ permissions while `num` is in use.
+2. When `num` was an immutable reference, the path `*num` only had the @Perm{read} permission. Now that `num` is a mutable reference, `*num` has also gained the @Perm{write} permission.
 
 The first observation is what makes mutable references *safe*. Mutable references allow mutation but prevent aliasing. The borrowed path `vec` becomes temporarily unusable, so effectively not an alias.
 
@@ -365,89 +363,82 @@ However, in the else-block, `c` is not used. `*v` immediately regains the @Perm{
 
 ### Data Must Outlive All Of Its References
 
-The last safety property is that **data must outlive any references to it.** For example, let's say we tried to return a reference to data inside a function:
+As a part of the *Pointer Safety Principle*, the borrow checker enforces that **data must outlive any references to it.** Rust enforces this property in two ways. The first way deals with references that are created and dropped within the scope of a single function. For example, say we tried to drop string while holding a reference to it:
 
-```rust,ignore,does_not_compile
-fn return_a_string() -> &String {
-    let s = String::from("Hello world");
-    let s_ref = &s;
-    s_ref
+```aquascope,permissions,stepper,boundaries,shouldFail
+#fn main() {
+let s = String::from("Hello world");
+let s_ref = &s;`(focus,rxpaths:s$)`
+drop(s);`{}`
+println!("{}", s_ref);
+#}
+```
+
+To catch these kinds of errors, Rust uses the permissions we've already discussed. The borrow `&s` removes the @Perm{own} permission from `s`. However, `drop` expects the @Perm{own} permission, leading to a permission mismatch.
+
+The key idea is that in this example, Rust knows how long `s_ref` lives. But Rust needs a different enforcement mechanism when it doesn't know how long a reference lives. Specifically, when references are either input to a function, or output from a function. For example, here is a safe function that returns a reference to the first element in a vector:
+
+```aquascope,permissions,boundaries,showFlows
+fn first(strings: &Vec<String>) -> &String {
+    let s_ref = &strings[0];
+    return s_ref;`{}`
 }
 ```
 
-Rust will refuse to compile this program. It will give you a somewhat mysterious error message:
+This snippet introduces a new kind of permission, the flow permission @Perm{flow}. The @Perm{flow} permission is expected whenever an expression uses an input reference (like `&strings[0]`), or returns an output reference (like `return s_ref`). 
+
+Unlike the @Perm{read}@Perm{write}@Perm{own} permissions, @Perm{flow} does not change throughout the body of a function. A reference has the @Perm{flow} permission if it's allowed to be used (that is, to *flow*) in a particular expression. For example, let's say we change `first` to a new function `first_or` that includes a `default` parameter:
+
+```aquascope,permissions,boundaries,showFlows,shouldFail
+fn first_or(strings: &Vec<String>, default: &String) -> &String {
+    if strings.len() > 0 {
+        &strings[0]`{}`
+    } else {
+        default`{}`
+    }    
+}
+```
+
+This function no longer compiles, because the expressions `&strings[0]` and `default` lack the necessary @Perm{flow} permission to be returned. But why? Rust gives the following error:
 
 ```text
 error[E0106]: missing lifetime specifier
- --> test.rs:1:25
+ --> test.rs:1:57
   |
-1 | fn return_a_string() -> &String {
-  |                         ^ expected named lifetime parameter
+1 | fn first_or(strings: &Vec<String>, default: &String) -> &String {
+  |                      ------------           -------     ^ expected named lifetime parameter
   |
-  = help: this function's return type contains a borrowed value, but there is no value for it to be borrowed from
+  = help: this function's return type contains a borrowed value, but the signature does not say whether it is borrowed from `strings` or `default`
 ```
 
-We will explain more about named lifetime parameters in Chapter 10.3, ["Validating References with Lifetimes"](ch10-03-lifetime-syntax.html). For now, you can see the underlying safety issue from this simulation:
+The message "missing lifetime specifier" is a bit mysterious, but the help message provides some useful context. If Rust *just* looks at the function signature, it doesn't know whether the output `&String` is a reference to either `strings` or `default`. To understand why that matters, let's say we used `first_or` like this:
 
-```aquascope,interpreter,shouldFail,horizontal
+```rust,ignore
+fn main() {
+    let strings = vec![];
+    let default = String::from("default");
+    let s = first_or(&strings, &default);
+    drop(default);
+    println!("{}", s);
+}
+```
+
+This program is unsafe if `first_or` allows `default` to *flow* into the return value. Like the previous example, `drop` could invalidate `s`. Rust would only allow this program to compile if it was *certain* that `default` cannot flow into the return value.
+
+To specify whether `default` can be returned, Rust provides a mechanism called *lifetime parameters*. We will explain that feature later in Chapter 10.3, ["Validating References with Lifetimes"](ch10-03-lifetime-syntax.html). For now, it's enough to know that: (1) input/output references are treated differently than references within a function body, and (2) Rust uses a different mechanism, the @Perm{flow} permission, to check the safety of those references.
+
+To see the @Perm{flow} permission in another context, say you tried to return a reference to a variable on the stack like this:
+
+```aquascope,permissions,boundaries,showFlows,shouldFail
 fn return_a_string() -> &String {
     let s = String::from("Hello world");
-    let s_ref = &s;`[]`
-    s_ref
-}
-
-fn main() {
-  let s_main = return_a_string();`[]`
-  println!("{}", s_main);`[]`
+    let s_ref = &s;
+    s_ref`{}`
 }
 ```
 
-At L1, `s_ref` points to a variable `s` within the stack frame of `return_a_string`. When `return_a_string` ends, `s` and its heap data are deallocated. At L2, `s_ref` has been returned and is now `s_main`, which points to freed memory. So far, the program is actually safe --- no undefined behavior has happened.
+This program is unsafe because the reference `&s` will be invalidated when `return_a_string` returns. And Rust will reject this program with a similar `missing lifetime specifier` error. Now you can understand that error means that `s_ref` is missing the appropriate flow permissions.
 
-However, at L3 we try to actually *use* the deallocated pointer `s_main` by reading it in the `println`. That read of freed memory is undefined behavior. In sum, it's unsafe to return a reference to data on a function's stack frame, and to then use that reference. The reference cannot outlive the data.
-
-As a more interesting example, let's say we tried to add a reference to a vector of references:
-
-```rust,ignore,does_not_compile
-fn add_ref(v: &mut Vec<&i32>, n: i32) {
-    let r = &n;
-    v.push(r);
-}
-```
-
-Rust will also reject this function, but with a different error:
-
-```text
-error[E0597]: `n` does not live long enough
- --> src/lib.rs:2:13
-  |
-1 | fn add_ref(v: &mut Vec<&i32>, n: i32) {
-  |                        - let's call the lifetime of this reference `'1`
-2 |     let r = &n;
-  |             ^^ borrowed value does not live long enough
-3 |     v.push(r);
-  |     --------- argument requires that `n` is borrowed for `'1`
-4 | }
-  |  - `n` dropped here while still borrowed
-```
-
-The argument `n` only lives for the duration of `add_ref`. However, the reference `r` is being pushed into `v`, and `v` lives longer than `add_ref`. Therefore Rust complains that the data (`n`) does not outlive all of its references (`r`).
-
-If this function were allowed, we could call `add_ref` like this:
-
-```aquascope,interpreter,shouldFail
-fn add_ref(v: &mut Vec<&i32>, n: i32) {
-    let r = &n;
-    v.push(r);`[]`    
-}
-fn main() {
-    let mut nums = Vec::new();
-    add_ref(&mut nums, 0);
-    println!("{}", nums[0]);`[]`
-}
-```
-
-At L1, by pushing `&n` into `v`, the vector now contains a reference to data within the frame for `add_ref`. However, when `add_ref` returns, its frame is deallocated. Therefore the reference in the vector points to deallocated memory. Using the reference by printing `v[0]` violates memory safety.
 
 {{#quiz ../quizzes/ch04-02-references-sec3-safety.toml}}
 
